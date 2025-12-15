@@ -216,3 +216,44 @@ Thumbs.db
 
 mockup/
 research-copilot/
+
+# Project-specific files
+key.txt
+results.txt
+changes.txt
+*_results.json
+*.db
+*.sqlite
+*.sqlite3
+*.ipynb
+test_rulechef_trained.py
+train_rulechef_from_clapnq.py
+test_rulechef_minimal.py
+
+# Data directories
+rulechef_data/
+rulechef_models/
+scripts/rulechef_data/
+scripts/rulechef_models/
+
+# Model files
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+*.model
+*.weights
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+
+# Log files
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup

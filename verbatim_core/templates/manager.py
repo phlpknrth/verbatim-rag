@@ -103,6 +103,10 @@ class TemplateManager:
         :param citation_spans: Spans for citation reference only
         :return: Completed response text
         """
+        # CLAPNQ: Return empty string for unanswerable questions
+        if not display_spans and not citation_spans:
+            return ""
+
         # Extract span texts for template generation
         all_spans = [span["text"] for span in display_spans + citation_spans]
         citation_count = len(citation_spans)
@@ -128,6 +132,10 @@ class TemplateManager:
         :param citation_spans: Spans for citation reference only
         :return: Completed response text
         """
+        # CLAPNQ: Return empty string for unanswerable questions
+        if not display_spans and not citation_spans:
+            return ""
+
         all_spans = [span["text"] for span in display_spans + citation_spans]
         citation_count = len(citation_spans)
 

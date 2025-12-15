@@ -7,6 +7,8 @@ with a `.text` attribute as search results.
 
 from __future__ import annotations
 
+import json
+import os
 from abc import ABC, abstractmethod
 from typing import Any, List, Dict
 
@@ -187,6 +189,7 @@ class LLMSpanExtractor(SpanExtractor):
         extraction_mode: str = "auto",
         max_display_spans: int = 5,
         batch_size: int = 5,
+        prompt_template_name: str = "default",
     ):
         """
         Initialize the LLM span extractor.
@@ -196,11 +199,27 @@ class LLMSpanExtractor(SpanExtractor):
         :param extraction_mode: "batch", "individual", or "auto"
         :param max_display_spans: Maximum spans to prioritize for display
         :param batch_size: Maximum documents to process in batch mode
+        :param prompt_template_name: Name of the prompt template to use (default: "default")
         """
+        from .prompt_templates import get_extraction_prompt
+        
         self.llm_client = llm_client or LLMClient(model)
         self.extraction_mode = extraction_mode
         self.max_display_spans = max_display_spans
         self.batch_size = batch_size
+        
+        # Validate and load prompt template
+        from .prompt_templates import list_available_templates
+        
+        try:
+            self.prompt_template_func = get_extraction_prompt(prompt_template_name)
+            self.prompt_template_name = prompt_template_name
+        except ValueError as e:
+            available = ", ".join(list_available_templates())
+            raise ValueError(
+                f"Invalid prompt_template_name '{prompt_template_name}'. "
+                f"Available templates: {available}"
+            ) from e
 
     def extract_spans(
         self, question: str, search_results: List[Any]
@@ -258,14 +277,18 @@ class LLMSpanExtractor(SpanExtractor):
         # Limit to batch_size to avoid prompt size issues
         top_results = search_results[: self.batch_size]
 
-        # Build document mapping for LLMClient
+        # Build document mapping for prompt template
         documents_text = {}
         for i, result in enumerate(top_results):
             documents_text[f"doc_{i}"] = getattr(result, "text", "")
 
         try:
-            # Use LLMClient for extraction
-            extracted_data = self.llm_client.extract_spans(question, documents_text)
+            # Build prompt using the selected template
+            prompt = self.prompt_template_func(question, documents_text)
+            
+            # Call LLM with JSON mode
+            response = self.llm_client.complete(prompt, json_mode=True)
+            extracted_data = json.loads(response)
 
             # Map back to original search results and verify spans
             verified_spans = {}
@@ -305,9 +328,12 @@ class LLMSpanExtractor(SpanExtractor):
             documents_text[f"doc_{i}"] = getattr(result, "text", "")
 
         try:
-            extracted_data = await self.llm_client.extract_spans_async(
-                question, documents_text
-            )
+            # Build prompt using the selected template
+            prompt = self.prompt_template_func(question, documents_text)
+            
+            # Call LLM with JSON mode (async)
+            response = await self.llm_client.complete_async(prompt, json_mode=True)
+            extracted_data = json.loads(response)
 
             verified_spans = {}
 
@@ -345,9 +371,19 @@ class LLMSpanExtractor(SpanExtractor):
         for result in search_results:
             result_text = getattr(result, "text", "")
             try:
-                extracted_spans = self.llm_client.extract_relevant_spans(
-                    question, result_text
-                )
+                # Build document dict for single document
+                documents_text = {"doc_0": result_text}
+                
+                # Build prompt using the selected template
+                prompt = self.prompt_template_func(question, documents_text)
+                
+                # Call LLM with JSON mode
+                response = self.llm_client.complete(prompt, json_mode=True)
+                extracted_data = json.loads(response)
+                
+                # Extract spans for doc_0
+                extracted_spans = extracted_data.get("doc_0", [])
+                
                 verified = self._verify_spans(extracted_spans, result_text)
                 all_spans[result_text] = verified
             except Exception as e:
@@ -368,9 +404,19 @@ class LLMSpanExtractor(SpanExtractor):
         for result in search_results:
             result_text = getattr(result, "text", "")
             try:
-                extracted_spans = await self.llm_client.extract_relevant_spans_async(
-                    question, result_text
-                )
+                # Build document dict for single document
+                documents_text = {"doc_0": result_text}
+                
+                # Build prompt using the selected template
+                prompt = self.prompt_template_func(question, documents_text)
+                
+                # Call LLM with JSON mode (async)
+                response = await self.llm_client.complete_async(prompt, json_mode=True)
+                extracted_data = json.loads(response)
+                
+                # Extract spans for doc_0
+                extracted_spans = extracted_data.get("doc_0", [])
+                
                 verified = self._verify_spans(extracted_spans, result_text)
                 all_spans[result_text] = verified
             except Exception as e:
@@ -382,17 +428,270 @@ class LLMSpanExtractor(SpanExtractor):
     def _verify_spans(self, spans: List[str], document_text: str) -> List[str]:
         """
         Verify that extracted spans actually exist in the document text.
-
-        :param spans: List of spans to verify
-        :param document_text: Original document text
-        :return: List of verified spans that exist in the document
+        With normalization for whitespace and quote differences.
         """
         verified = []
         for span in spans:
-            if span.strip() and span.strip() in document_text:
-                verified.append(span.strip())
+            span_clean = span.strip()
+            if not span_clean:
+                continue
+                
+            # Try exact match first
+            if span_clean in document_text:
+                verified.append(span_clean)
+                continue
+                
+            # Normalize both texts for comparison
+            span_norm = self._normalize_for_matching(span_clean)
+            doc_norm = self._normalize_for_matching(document_text)
+            
+            if span_norm in doc_norm:
+                # Find the actual matching text in the original document
+                original_match = self._find_matching_text(span_clean, document_text)
+                if original_match:
+                    verified.append(original_match)
+                else:
+                    verified.append(span_clean)  # Fallback
+            # If direct match fails, try matching without quotes (for cases where quotes differ)
+            elif self._match_without_quotes(span_norm, doc_norm):
+                # Find the actual matching text in the original document
+                original_match = self._find_matching_text(span_clean, document_text)
+                if original_match:
+                    verified.append(original_match)
+                else:
+                    verified.append(span_clean)  # Fallback
             else:
-                print(
-                    f"Warning: Span not found verbatim in document: '{span[:100]}...'"
-                )
+                # Simple warning when span is not found
+                span_preview = span_clean[:100] + "..." if len(span_clean) > 100 else span_clean
+                print(f"Warning: Span not found after normalization: '{span_preview}'")
+        
         return verified
+
+    def _normalize_for_matching(self, text: str) -> str:
+        """Simple normalization for matching.
+        
+        Normalizes quotes and whitespace so that texts with different quote styles
+        and spacing are recognized as equal.
+        """
+        import re
+        
+        # Normalize all quote variants to standard double quotes (keep quotes, just make them uniform)
+        text = text.replace('``', '"').replace("''", '"')
+        text = text.replace('"', '"').replace('"', '"')  # Left double quote
+        text = text.replace('"', '"').replace('"', '"')  # Right double quote
+        # Normalize single quotes to double quotes for consistency
+        text = text.replace("'", '"').replace("'", '"')
+        
+        # Normalize hyphens with spaces: "real - life" -> "real-life"
+        text = re.sub(r'\s+-\s+', '-', text)  # Remove spaces around hyphens
+        
+        # Normalize whitespace around parentheses
+        # Remove space after opening parenthesis: "( text" -> "(text"
+        text = re.sub(r'\(\s+', '(', text)
+        # Remove space before closing parenthesis: "text )" -> "text)"
+        text = re.sub(r'\s+\)', ')', text)
+        
+        # Normalize whitespace around quotes
+        # Remove spaces before opening quotes
+        text = re.sub(r'\s+"', '"', text)
+        # Ensure space after closing quotes if followed by a letter (but don't add if already there)
+        text = re.sub(r'"([a-zA-Z])', r'" \1', text)  # Add space if missing
+        # Remove extra spaces after closing quotes
+        text = re.sub(r'"\s+', '" ', text)  # Normalize to single space
+        
+        # Normalize whitespace around punctuation
+        text = re.sub(r'\s+([.,:;!?])', r'\1', text)  # Remove space before punctuation
+        text = re.sub(r'\s+', ' ', text)  # Multiple spaces to single space
+        
+        return text.strip()
+    
+    def _match_without_quotes(self, span_norm: str, doc_norm: str) -> bool:
+        """Check if span matches document when quotes are removed from both.
+        
+        This handles cases where the span and document have different quote styles
+        but the same content.
+        """
+        import re
+        # Remove all quotes for comparison
+        span_no_quotes = re.sub(r'["\']', '', span_norm)
+        doc_no_quotes = re.sub(r'["\']', '', doc_norm)
+        return span_no_quotes in doc_no_quotes
+
+    def _find_matching_text(self, span: str, document: str) -> str:
+        """Find the original text that matches the span."""
+        # This could be made more sophisticated, but for now just return the span
+        return span
+
+
+class RuleChefSpanExtractor(SpanExtractor):
+    """
+    Extract spans using RuleChef's learned rule-based models.
+    
+    RuleChef learns extraction rules from examples and corrections, providing
+    more consistent and precise span extraction compared to direct LLM calls.
+    """
+
+    def __init__(
+        self,
+        llm_client: LLMClient | None = None,
+        model: str = "gpt-4o-mini",
+        examples: List[tuple[Dict[str, Any], Dict[str, Any]]] | None = None,
+        task_name: str = "Span Extraction",
+        task_description: str = "Extract relevant answer spans from documents",
+        auto_learn: bool = True,
+    ):
+        """
+        Initialize the RuleChef span extractor.
+
+        :param llm_client: LLM client for RuleChef (creates one if None)
+        :param model: The LLM model to use (if creating new client)
+        :param examples: List of (input, output) tuples for training.
+                         Input: {"question": str, "context": str}
+                         Output: {"spans": List[Dict] with "text", "start", "end"}
+        :param task_name: Name for the RuleChef task
+        :param task_description: Description for the RuleChef task
+        :param auto_learn: Whether to automatically learn rules from examples on init
+        """
+        # Try to import RuleChef
+        try:
+            from openai import OpenAI
+            from rulechef import RuleChef, Task
+        except ImportError as e:
+            raise ImportError(
+                "RuleChef is required for RuleChefSpanExtractor. "
+                "Install it with: pip install rulechef"
+            ) from e
+
+        self.llm_client = llm_client or LLMClient(model)
+        self.examples = examples or []
+        self.task_name = task_name
+        self.task_description = task_description
+        self.auto_learn = auto_learn
+
+        # Initialize OpenAI client for RuleChef
+        # RuleChef needs OpenAI client, not our LLMClient wrapper
+        api_key = self.llm_client.api_key
+        if api_key == "EMPTY":
+            api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key or api_key == "EMPTY":
+            raise ValueError(
+                "OpenAI API key required for RuleChef. "
+                "Set OPENAI_API_KEY environment variable or provide LLMClient with API key."
+            )
+
+        openai_client = OpenAI(api_key=api_key)
+
+        # Define the task
+        self.task = Task(
+            name=task_name,
+            description=task_description,
+            input_schema={"question": "str", "context": "str"},
+            output_schema={"spans": "List[Span]"},
+        )
+
+        # Initialize RuleChef
+        self.chef = RuleChef(self.task, openai_client)
+
+        # Add examples and learn rules if provided
+        if self.examples:
+            for input_ex, output_ex in self.examples:
+                self.chef.add_example(input_ex, output_ex)
+
+        if self.auto_learn and self.examples:
+            print(f"Learning rules from {len(self.examples)} examples...")
+            try:
+                self.chef.learn_rules()
+                print("Rules learned successfully.")
+            except Exception as e:
+                print(f"⚠️  Warning: Rule learning encountered errors: {e}")
+                print("   The extractor will still work, but rules may not be optimal.")
+                print("   Consider using auto_learn=False or fewer examples.")
+
+    def add_example(
+        self, input_example: Dict[str, Any], output_example: Dict[str, Any]
+    ) -> None:
+        """
+        Add a training example to RuleChef.
+
+        :param input_example: Input dict with "question" and "context"
+        :param output_example: Output dict with "spans" list
+        """
+        self.chef.add_example(input_example, output_example)
+        self.examples.append((input_example, output_example))
+
+    def learn_rules(self) -> None:
+        """Learn rules from all added examples."""
+        if not self.examples:
+            print("Warning: No examples provided. Learning rules without examples.")
+        self.chef.learn_rules()
+
+    def extract_spans(
+        self, question: str, search_results: List[Any]
+    ) -> Dict[str, List[str]]:
+        """
+        Extract spans using RuleChef's learned rules.
+
+        :param question: The query or question
+        :param search_results: List of search results to extract from
+        :return: Dictionary mapping result text to list of relevant spans
+        """
+        if not search_results:
+            return {}
+
+        relevant_spans = {}
+
+        for result in search_results:
+            context = getattr(result, "text", "")
+            if not context:
+                relevant_spans[context] = []
+                continue
+
+            try:
+                # Use RuleChef to extract spans
+                # RuleChef.extract() expects a single dictionary argument matching input_schema
+                # Returns a dictionary: {'spans': [{'text': ..., 'start': ..., 'end': ...}, ...]}
+                input_dict = {"question": question, "context": context}
+                result = self.chef.extract(input_dict)
+
+                # Extract spans from result dictionary
+                if isinstance(result, dict) and 'spans' in result:
+                    spans = result['spans']
+                elif isinstance(result, tuple) and len(result) >= 1:
+                    spans = result[0]
+                else:
+                    spans = result if isinstance(result, list) else []
+
+                # Convert RuleChef Span objects/dicts to strings
+                # RuleChef returns spans as dicts with 'text', 'start', 'end' keys
+                span_texts = []
+                for span in spans:
+                    if isinstance(span, dict):
+                        span_texts.append(span.get("text", str(span)))
+                    elif hasattr(span, "text"):
+                        span_texts.append(span.text)
+                    else:
+                        span_texts.append(str(span))
+
+                relevant_spans[context] = span_texts
+
+            except Exception as e:
+                print(f"RuleChef extraction failed for document: {e}")
+                # Fallback: return empty spans on error
+                relevant_spans[context] = []
+
+        return relevant_spans
+
+    async def extract_spans_async(
+        self, question: str, search_results: List[Any]
+    ) -> Dict[str, List[str]]:
+        """
+        Async version of span extraction using RuleChef.
+
+        :param question: The query or question
+        :param search_results: List of search results to extract from
+        :return: Dictionary mapping result text to list of relevant spans
+        """
+        import asyncio
+
+        # RuleChef doesn't have native async support, so we run in a thread
+        return await asyncio.to_thread(self.extract_spans, question, search_results)

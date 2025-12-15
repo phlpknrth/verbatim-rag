@@ -92,16 +92,26 @@ class LLMClient:
         return response.choices[0].message.content
 
     def extract_spans(
-        self, question: str, documents: Dict[str, str]
+        self, question: str, documents: Dict[str, str], prompt_template_name: str = "default"
     ) -> Dict[str, List[str]]:
         """
         Specialized method for span extraction from documents.
 
         :param question: The user's question
         :param documents: Dictionary mapping doc IDs to document text
+        :param prompt_template_name: Name of the prompt template to use (default: "default")
         :return: Dictionary mapping doc IDs to lists of extracted spans
         """
-        prompt = self._build_extraction_prompt(question, documents)
+        from .prompt_templates import get_extraction_prompt
+        
+        # Use template system if available, otherwise fall back to old method
+        try:
+            prompt_template_func = get_extraction_prompt(prompt_template_name)
+            prompt = prompt_template_func(question, documents)
+        except (ValueError, ImportError):
+            # Fallback to old method for backward compatibility
+            prompt = self._build_extraction_prompt(question, documents)
+        
         try:
             response = self.complete(prompt, json_mode=True)
             return json.loads(response)
@@ -111,16 +121,26 @@ class LLMClient:
             return {doc_id: [] for doc_id in documents.keys()}
 
     async def extract_spans_async(
-        self, question: str, documents: Dict[str, str]
+        self, question: str, documents: Dict[str, str], prompt_template_name: str = "default"
     ) -> Dict[str, List[str]]:
         """
         Async span extraction from documents.
 
         :param question: The user's question
         :param documents: Dictionary mapping doc IDs to document text
+        :param prompt_template_name: Name of the prompt template to use (default: "default")
         :return: Dictionary mapping doc IDs to lists of extracted spans
         """
-        prompt = self._build_extraction_prompt(question, documents)
+        from .prompt_templates import get_extraction_prompt
+        
+        # Use template system if available, otherwise fall back to old method
+        try:
+            prompt_template_func = get_extraction_prompt(prompt_template_name)
+            prompt = prompt_template_func(question, documents)
+        except (ValueError, ImportError):
+            # Fallback to old method for backward compatibility
+            prompt = self._build_extraction_prompt(question, documents)
+        
         try:
             response = await self.complete_async(prompt, json_mode=True)
             return json.loads(response)
@@ -192,24 +212,25 @@ class LLMClient:
 
     def _build_extraction_prompt(self, question: str, documents: Dict[str, str]) -> str:
         """Build the prompt for batch span extraction."""
-        return f"""Extract EXACT verbatim text spans from multiple documents that answer the question.
+        return f"""Extract EXACT verbatim sentences from the document that answer the question.
 
 # Rules
-1. Extract **only** text that explicitly addresses the question
-2. Never paraphrase, modify, or add to the original text
-3. Preserve original wording, capitalization, and punctuation
-4. Order spans within each document by relevance - MOST RELEVANT FIRST
-5. Include complete sentences or paragraphs for context
+1. Extract **only complete sentences** that explicitly address the question
+2. Each extracted span must be a complete sentence from start to end
+3. Never paraphrase, modify, or add to the original text
+4. Preserve original wording, capitalization, and punctuation exactly
+5. Order sentences by relevance - MOST RELEVANT FIRST
+6. Extract sentence boundaries precisely (start with capital letter, end with punctuation)
 
 # Output Format
-Return a JSON object mapping document IDs to span arrays ordered by relevance:
+Return a JSON object mapping document IDs to sentence arrays ordered by relevance:
 {{
-  "doc_0": ["most relevant span", "next most relevant span"],
+  "doc_0": ["most relevant sentence", "next most relevant sentence"],
   "doc_1": ["most relevant from doc 1"],
   "doc_2": []
 }}
 
-If no relevant information in a document, use empty array.
+If no relevant sentences found, use empty array.
 
 # Your Task
 Question: {question}
@@ -217,7 +238,7 @@ Question: {question}
 Documents:
 {json.dumps(documents, indent=2)}
 
-Extract verbatim spans from each document:"""
+Extract complete sentences from each document:"""
 
     def _build_per_fact_template_prompt(
         self, question: str, spans: List[str], citation_count: int
