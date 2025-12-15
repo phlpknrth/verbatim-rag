@@ -92,6 +92,9 @@ class VerbatimRAG:
             llm_client=self.llm_client, default_mode=template_mode
         )
 
+        # Ensure template manager has access to RAG system for structured mode
+        self.template_manager.set_rag_system(self)
+
         self.response_builder = ResponseBuilder()
 
     def _generate_template(
@@ -147,81 +150,208 @@ class VerbatimRAG:
             template, display_spans, citation_spans
         )
 
-    def query(self, question: str, filter: Optional[str] = None) -> QueryResponse:
-        """
-        Process a query through the Verbatim RAG system with clean architecture.
-
-        :param question: The user's question
-        :param filter: Optional filter to narrow document search
-        :return: A QueryResponse object containing the structured response
-        """
-        # Step 1: Retrieve documents
-        search_results = self.index.query(text=question, k=self.k, filter=filter)
-
-        # Step 2: Extract spans
-        print("Extracting relevant spans...")
-        all_relevant_spans = self.extractor.extract_spans(question, search_results)
-
-        # Step 3: Split spans into display vs citation-only
-        print("Processing spans...")
-        display_spans, citation_spans = self._rank_and_split_spans(all_relevant_spans)
-
-        # Step 4: Generate and fill template in one operation
-        print("Generating response...")
-        answer = self.template_manager.process(question, display_spans, citation_spans)
-
-        # Step 5: Clean up the answer
-        answer = self.response_builder.clean_answer(answer)
-
-        # Step 6: Build the complete response
-        return self.response_builder.build_response(
-            question=question,
-            answer=answer,
-            search_results=search_results,
-            relevant_spans=all_relevant_spans,
-            display_span_count=len(display_spans),
-        )
-
-    async def query_async(
-        self, question: str, filter: Optional[str] = None
+    def query(
+        self,
+        question: str,
+        k: Optional[int] = None,
+        filter: Optional[str] = None,
+        hybrid_weights: Optional[dict[str, float]] = None,
+        rrf_k: int = 60,
     ) -> QueryResponse:
         """
-        Async version of query method with clean architecture.
+        Process a query through the Verbatim RAG system.
 
         :param question: The user's question
+        :param k: Number of documents to retrieve (uses self.k if not provided)
         :param filter: Optional filter to narrow document search
+        :param hybrid_weights: Optional dict mapping method names to weights (e.g., {"dense": 0.5, "sparse": 0.3, "full_text": 0.2})
+        :param rrf_k: RRF constant for hybrid search (default: 60)
         :return: A QueryResponse object containing the structured response
         """
         # Step 1: Retrieve documents
-        search_results = self.index.query(text=question, k=self.k, filter=filter)
-
-        # Step 2: Extract spans (async)
-        print("Extracting relevant spans (async)...")
-        all_relevant_spans = await self.extractor.extract_spans_async(
-            question, search_results
+        k = k or self.k
+        search_results = self.index.query(
+            text=question,
+            k=k,
+            filter=filter,
+            hybrid_weights=hybrid_weights,
+            rrf_k=rrf_k,
         )
 
-        # Step 3: Split spans into display vs citation-only
-        print("Processing spans...")
-        display_spans, citation_spans = self._rank_and_split_spans(all_relevant_spans)
+        # Step 2: Check mode and extract accordingly
+        if self.template_manager.current_mode == "structured":
+            answer, all_relevant_spans = self._process_structured(
+                question, search_results
+            )
+        else:
+            # Standard extraction flow
+            print("Extracting relevant spans...")
+            all_relevant_spans = self.extractor.extract_spans(question, search_results)
 
-        # Step 4: Generate and fill template (async)
-        print("Generating response (async)...")
-        answer = await self.template_manager.process_async(
-            question, display_spans, citation_spans
-        )
+            print("Processing spans...")
+            display_spans, citation_spans = self._rank_and_split_spans(
+                all_relevant_spans
+            )
 
-        # Step 5: Clean up the answer
+            print("Generating response...")
+            answer = self.template_manager.process(
+                question, display_spans, citation_spans
+            )
+
+        # Clean up and build response
         answer = self.response_builder.clean_answer(answer)
 
-        # Step 6: Build the complete response
         return self.response_builder.build_response(
             question=question,
             answer=answer,
             search_results=search_results,
             relevant_spans=all_relevant_spans,
-            display_span_count=len(display_spans),
+            display_span_count=len(all_relevant_spans),
         )
+
+    def _process_structured(
+        self, question: str, search_results: list
+    ) -> tuple[str, dict]:
+        """
+        Process query in structured mode - template controls extraction.
+
+        :param question: The user's question
+        :param search_results: Retrieved documents
+        :return: Tuple of (filled_answer, spans_dict in response_builder format)
+        """
+        strategy = self.template_manager.strategies["structured"]
+        template = strategy.template
+        placeholders = strategy.get_placeholder_hints()
+
+        # Get document texts
+        doc_texts = [getattr(r, "text", str(r)) for r in search_results]
+
+        # Structured extraction via LLM - returns {PLACEHOLDER: [{text, doc}, ...]}
+        span_map = self.llm_client.extract_structured(
+            question, template, placeholders, doc_texts
+        )
+
+        # Fill template with spans
+        answer = strategy.fill_with_spans(span_map)
+
+        # Convert to response_builder format: {doc_text: [spans]}
+        relevant_spans = self._convert_structured_to_doc_spans(span_map, doc_texts)
+
+        return answer, relevant_spans
+
+    async def query_async(
+        self,
+        question: str,
+        k: Optional[int] = None,
+        filter: Optional[str] = None,
+        hybrid_weights: Optional[dict[str, float]] = None,
+        rrf_k: int = 60,
+    ) -> QueryResponse:
+        """
+        Async version of query method.
+
+        :param question: The user's question
+        :param k: Number of documents to retrieve (uses self.k if not provided)
+        :param filter: Optional filter to narrow document search
+        :param hybrid_weights: Optional dict mapping method names to weights (e.g., {"dense": 0.5, "sparse": 0.3, "full_text": 0.2})
+        :param rrf_k: RRF constant for hybrid search (default: 60)
+        :return: A QueryResponse object containing the structured response
+        """
+        # Step 1: Retrieve documents
+        k = k or self.k
+        search_results = self.index.query(
+            text=question,
+            k=k,
+            filter=filter,
+            hybrid_weights=hybrid_weights,
+            rrf_k=rrf_k,
+        )
+
+        # Step 2: Check mode and extract accordingly
+        if self.template_manager.current_mode == "structured":
+            answer, all_relevant_spans = await self._process_structured_async(
+                question, search_results
+            )
+        else:
+            # Standard extraction flow
+            print("Extracting relevant spans (async)...")
+            all_relevant_spans = await self.extractor.extract_spans_async(
+                question, search_results
+            )
+
+            print("Processing spans...")
+            display_spans, citation_spans = self._rank_and_split_spans(
+                all_relevant_spans
+            )
+
+            print("Generating response (async)...")
+            answer = await self.template_manager.process_async(
+                question, display_spans, citation_spans
+            )
+
+        # Clean up and build response
+        answer = self.response_builder.clean_answer(answer)
+
+        return self.response_builder.build_response(
+            question=question,
+            answer=answer,
+            search_results=search_results,
+            relevant_spans=all_relevant_spans,
+            display_span_count=len(all_relevant_spans),
+        )
+
+    async def _process_structured_async(
+        self, question: str, search_results: list
+    ) -> tuple[str, dict]:
+        """
+        Async structured mode processing.
+
+        :param question: The user's question
+        :param search_results: Retrieved documents
+        :return: Tuple of (filled_answer, spans_dict in response_builder format)
+        """
+        strategy = self.template_manager.strategies["structured"]
+        template = strategy.template
+        placeholders = strategy.get_placeholder_hints()
+
+        # Get document texts
+        doc_texts = [getattr(r, "text", str(r)) for r in search_results]
+
+        # Structured extraction via LLM - returns {PLACEHOLDER: [{text, doc}, ...]}
+        span_map = await self.llm_client.extract_structured_async(
+            question, template, placeholders, doc_texts
+        )
+
+        # Fill template with spans (pass the new format)
+        answer = strategy.fill_with_spans(span_map)
+
+        # Convert to response_builder format: {doc_text: [spans]}
+        relevant_spans = self._convert_structured_to_doc_spans(span_map, doc_texts)
+
+        return answer, relevant_spans
+
+    def _convert_structured_to_doc_spans(self, span_map: dict, doc_texts: list) -> dict:
+        """
+        Convert structured span_map to response_builder format.
+
+        :param span_map: {PLACEHOLDER: [{text, doc}, ...]}
+        :param doc_texts: List of document texts
+        :return: {doc_text: [spans]}
+        """
+        # Initialize with empty lists for all docs
+        result = {text: [] for text in doc_texts}
+
+        # Collect all spans by document
+        for placeholder, items in span_map.items():
+            for item in items:
+                doc_idx = item.get("doc", 0)
+                span_text = item.get("text", "")
+                if 0 <= doc_idx < len(doc_texts) and span_text:
+                    doc_text = doc_texts[doc_idx]
+                    if span_text not in result[doc_text]:  # Avoid duplicates
+                        result[doc_text].append(span_text)
+
+        return result
 
     def add_document(self, document: DocumentSchema) -> str:
         """

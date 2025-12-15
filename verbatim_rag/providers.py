@@ -44,9 +44,20 @@ class IndexProvider(RAGProvider):
         self.index = index
 
     def retrieve(
-        self, question: str, k: int = 5, filter: Optional[str] = None
+        self,
+        question: str,
+        k: int = 5,
+        filter: Optional[str] = None,
+        hybrid_weights: Optional[Dict[str, float]] = None,
+        rrf_k: int = 60,
     ) -> List[Dict[str, Any]]:
-        results = self.index.query(text=question, k=k, filter=filter)
+        results = self.index.query(
+            text=question,
+            k=k,
+            filter=filter,
+            hybrid_weights=hybrid_weights,
+            rrf_k=rrf_k,
+        )
         # Convert SearchResult -> UniversalDocument -> context dict
         context: List[Dict[str, Any]] = []
         for r in results:
@@ -64,9 +75,16 @@ class IndexProvider(RAGProvider):
         return context
 
     async def retrieve_async(
-        self, question: str, k: int = 5, filter: Optional[str] = None
+        self,
+        question: str,
+        k: int = 5,
+        filter: Optional[str] = None,
+        hybrid_weights: Optional[Dict[str, float]] = None,
+        rrf_k: int = 60,
     ) -> List[Dict[str, Any]]:
-        return await asyncio.to_thread(self.retrieve, question, k, filter)
+        return await asyncio.to_thread(
+            self.retrieve, question, k, filter, hybrid_weights, rrf_k
+        )
 
 
 class VerbatimRAGProvider(RAGProvider):
@@ -80,9 +98,20 @@ class VerbatimRAGProvider(RAGProvider):
         self.rag = rag
 
     def retrieve(
-        self, question: str, k: int = 5, filter: Optional[str] = None
+        self,
+        question: str,
+        k: int = 5,
+        filter: Optional[str] = None,
+        hybrid_weights: Optional[Dict[str, float]] = None,
+        rrf_k: int = 60,
     ) -> List[Dict[str, Any]]:
-        results = self.rag.index.query(text=question, k=k, filter=filter)
+        results = self.rag.index.query(
+            text=question,
+            k=k,
+            filter=filter,
+            hybrid_weights=hybrid_weights,
+            rrf_k=rrf_k,
+        )
         context: List[Dict[str, Any]] = []
         for r in results:
             context.append(
@@ -100,6 +129,13 @@ class VerbatimRAGProvider(RAGProvider):
         return context
 
     async def retrieve_async(
-        self, question: str, k: int = 5, filter: Optional[str] = None
+        self,
+        question: str,
+        k: int = 5,
+        filter: Optional[str] = None,
+        hybrid_weights: Optional[Dict[str, float]] = None,
+        rrf_k: int = 60,
     ) -> List[Dict[str, Any]]:
-        return await asyncio.to_thread(self.retrieve, question, k, filter)
+        return await asyncio.to_thread(
+            self.retrieve, question, k, filter, hybrid_weights, rrf_k
+        )

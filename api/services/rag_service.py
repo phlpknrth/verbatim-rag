@@ -3,7 +3,7 @@ RAG service implementation for the API layer
 """
 
 import logging
-from typing import Optional
+from typing import Optional, Dict
 
 from verbatim_rag.core import VerbatimRAG
 from verbatim_core.templates import TemplateManager
@@ -28,22 +28,38 @@ class APIService:
         if len(question) > 1000:
             raise ValueError("Question too long (max 1000 characters)")
 
-    def query(self, question: str, template_id: Optional[str] = None) -> QueryResponse:
+    def query(
+        self,
+        question: str,
+        template_id: Optional[str] = None,
+        k: Optional[int] = None,
+        hybrid_weights: Optional[Dict[str, float]] = None,
+        rrf_k: int = 60,
+    ) -> QueryResponse:
         """Execute a query through the RAG system"""
         try:
             # Use the RAG system to process the query
-            response = self.rag.query(question)
+            response = self.rag.query(
+                question, k=k, hybrid_weights=hybrid_weights, rrf_k=rrf_k
+            )
             return response
         except Exception as e:
             logger.error(f"Query execution failed: {e}")
             raise
 
     async def query_async(
-        self, question: str, template_id: Optional[str] = None
+        self,
+        question: str,
+        template_id: Optional[str] = None,
+        k: Optional[int] = None,
+        hybrid_weights: Optional[Dict[str, float]] = None,
+        rrf_k: int = 60,
     ) -> QueryResponse:
         """Execute an async query through the RAG system"""
         try:
-            response = await self.rag.query_async(question)
+            response = await self.rag.query_async(
+                question, k=k, hybrid_weights=hybrid_weights, rrf_k=rrf_k
+            )
             return response
         except Exception as e:
             logger.error(f"Async query execution failed: {e}")

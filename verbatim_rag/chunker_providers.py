@@ -34,16 +34,24 @@ class ChunkerProvider(ABC):
 
 class MarkdownChunkerProvider(ChunkerProvider):
     """
-    Markdown chunker with ancestor heading injection.
+    Markdown chunker with ancestor heading injection and adaptive sizing.
 
     This implementation preserves the exact markdown structure while adding
     ancestor headings to provide hierarchical context for each chunk.
+
+    Features:
+    - Chunks by markdown headers (H1-H6)
+    - Injects ancestor heading context
+    - Optional size constraints for merging tiny chunks and splitting large ones
+    - Protects tables and code blocks from being split
     """
 
     def __init__(
         self,
         split_levels: tuple = (1, 2, 3, 4),
         include_preamble: bool = True,
+        min_chunk_size: int = None,
+        max_chunk_size: int = None,
     ):
         """
         Initialize markdown chunker.
@@ -51,15 +59,35 @@ class MarkdownChunkerProvider(ChunkerProvider):
         Args:
             split_levels: Which header levels become chunks (default: H1-H4)
             include_preamble: Include text before first header as chunk
+            min_chunk_size: Minimum chunk size in characters. Tiny chunks are merged
+                           with the next chunk until >= min_chunk_size. Default: None (no merging)
+            max_chunk_size: Maximum chunk size in characters. Large chunks are split at
+                           paragraph boundaries, but tables and code blocks are never split.
+                           Default: None (no splitting)
         """
         self.split_levels = split_levels
         self.include_preamble = include_preamble
+        self.min_chunk_size = min_chunk_size
+        self.max_chunk_size = max_chunk_size
+
+        # Precompile regex patterns for protected regions
+        # Table pattern: contiguous lines starting with |
+        self.table_pattern = re.compile(r"(?:^[ ]*\|.+\n)+", re.MULTILINE)
+        self.code_pattern = re.compile(r"```[a-zA-Z0-9+\-_]*\n.*?\n```", re.DOTALL)
 
     def chunk(self, text: str) -> List[Tuple[str, str]]:
-        """Chunk markdown with ancestor heading injection."""
+        """Chunk markdown with ancestor heading injection and optional size constraints."""
         chunks = self._md_chunker_with_ancestor_injection(
             text, self.split_levels, self.include_preamble
         )
+
+        # Apply optional size constraints
+        if self.min_chunk_size is not None:
+            chunks = self._merge_tiny_chunks(chunks)
+
+        if self.max_chunk_size is not None:
+            chunks = self._split_large_chunks(chunks, text)
+
         return [(c["raw_chunk"], c["enhanced_chunk"]) for c in chunks]
 
     def _md_chunker_with_ancestor_injection(
@@ -199,6 +227,245 @@ class MarkdownChunkerProvider(ChunkerProvider):
         start = starts[a]
         end = starts[b_excl] if b_excl < len(starts) else n
         return start, end
+
+    def _find_protected_regions(self, text: str) -> List[Tuple[int, int]]:
+        """Find positions of tables (with captions) and code blocks that should not be split."""
+        protected = []
+
+        # Pattern for table captions: "Table N:" or "Table N." at start of line
+        caption_pattern = re.compile(r"^[ ]*Table\s+\d+[:\.].*$", re.MULTILINE)
+
+        # First, find all tables and captions
+        tables = []
+        for match in self.table_pattern.finditer(text):
+            block = match.group()
+            if re.search(r"\|[-:\s]+\|", block):
+                tables.append((match.start(), match.end()))
+
+        captions = [(m.start(), m.end()) for m in caption_pattern.finditer(text)]
+
+        # For each table, find its caption (before or after, whichever is closer)
+        for table_start, table_end in tables:
+            region_start = table_start
+            region_end = table_end
+
+            # Check for caption BEFORE table
+            for cap_start, cap_end in captions:
+                if cap_end <= table_start:
+                    between = text[cap_end:table_start]
+                    if between.strip() == "":
+                        # Check no other table between caption and this table
+                        other_table_between = any(
+                            cap_end < t_start < table_start for t_start, t_end in tables
+                        )
+                        if not other_table_between:
+                            region_start = cap_start
+
+            # Check for caption AFTER table (only if no table follows immediately)
+            for cap_start, cap_end in captions:
+                if cap_start >= table_end:
+                    between = text[table_end:cap_start]
+                    if between.strip() == "":
+                        # Check if there's a table after this caption
+                        table_after_caption = any(
+                            t_start > cap_end for t_start, t_end in tables
+                        )
+                        # Only attach caption-after if no table follows it
+                        if not table_after_caption:
+                            region_end = cap_end
+                    break  # Only check first caption after
+
+            protected.append((region_start, region_end))
+
+        # Find all code blocks
+        for match in self.code_pattern.finditer(text):
+            protected.append((match.start(), match.end()))
+
+        # Sort by start position
+        protected.sort()
+        return protected
+
+    def _combine_chunks(
+        self, first: Dict[str, Any], second: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Combine two adjacent chunks, keeping metadata from the first."""
+        return {
+            "raw_chunk": first["raw_chunk"] + second["raw_chunk"],
+            "enhanced_chunk": first["enhanced_chunk"] + second["enhanced_chunk"],
+            "header_path": first.get("header_path", []),
+            "level": first.get("level", 0),
+            "title": first.get("title", ""),
+            "start": first.get("start", 0),
+            "end": second.get("end", first.get("end", 0)),
+        }
+
+    def _merge_tiny_chunks(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Merge consecutive tiny chunks by combining with the next chunk."""
+        if not chunks:
+            return chunks
+
+        result = []
+        i = 0
+
+        while i < len(chunks):
+            chunk = chunks[i]
+
+            # If this chunk is tiny and not the last chunk, merge with next
+            if len(chunk["raw_chunk"]) < self.min_chunk_size and i + 1 < len(chunks):
+                merged_chunk = self._combine_chunks(chunk, chunks[i + 1])
+
+                # Check if merged result is still tiny - if so, queue for next iteration
+                if len(merged_chunk["raw_chunk"]) < self.min_chunk_size and i + 2 < len(
+                    chunks
+                ):
+                    chunks[i + 1] = merged_chunk
+                    i += 1
+                else:
+                    result.append(merged_chunk)
+                    i += 2
+            else:
+                # If this is the last chunk and it's tiny, merge backward
+                if (
+                    i == len(chunks) - 1
+                    and len(chunk["raw_chunk"]) < self.min_chunk_size
+                    and result
+                ):
+                    result[-1] = self._combine_chunks(result[-1], chunk)
+                else:
+                    result.append(chunk)
+                i += 1
+
+        return result
+
+    def _split_large_chunks(
+        self, chunks: List[Dict[str, Any]], full_text: str
+    ) -> List[Dict[str, Any]]:
+        """Split chunks larger than max_chunk_size at paragraph boundaries.
+
+        Splits BETWEEN tables/code blocks, never inside them.
+        """
+        protected_regions = self._find_protected_regions(full_text)
+        result = []
+
+        for chunk in chunks:
+            raw = chunk["raw_chunk"]
+
+            # If chunk is small enough, keep as-is
+            if len(raw) <= self.max_chunk_size:
+                result.append(chunk)
+                continue
+
+            chunk_start = full_text.find(raw)
+
+            # Find valid split points (between protected regions, not inside)
+            splits = self._find_valid_split_points(raw, chunk_start, protected_regions)
+
+            if not splits:
+                # No valid split points, keep chunk as-is
+                result.append(chunk)
+                continue
+
+            # Split at valid boundaries
+            result.extend(self._split_at_points(raw, splits, chunk))
+
+        # Splitting can create tiny fragments; merge them back up if needed
+        if self.min_chunk_size is not None:
+            return self._merge_tiny_chunks(result)
+
+        return result
+
+    def _find_valid_split_points(
+        self, text: str, offset: int, protected_regions: List[Tuple[int, int]]
+    ) -> List[int]:
+        """Find paragraph boundaries (\\n\\n) that are NOT inside a protected region."""
+        splits = []
+        for match in re.finditer(r"\n\n+", text):
+            # Check both start and end of the whitespace to handle boundary cases
+            abs_start = offset + match.start()
+            abs_end = offset + match.end()
+            # Valid split if the boundary falls between protected regions
+            if not self._position_in_protected_region(
+                abs_start, protected_regions
+            ) or not self._position_in_protected_region(abs_end - 1, protected_regions):
+                # Additional check: don't split if we're completely inside a single region
+                inside_same_region = any(
+                    start <= abs_start and abs_end <= end
+                    for start, end in protected_regions
+                )
+                if not inside_same_region:
+                    splits.append(match.start())
+        return splits
+
+    def _position_in_protected_region(
+        self, pos: int, protected_regions: List[Tuple[int, int]]
+    ) -> bool:
+        """Check if a position falls inside any protected region."""
+        for start, end in protected_regions:
+            if start <= pos < end:
+                return True
+        return False
+
+    def _split_at_points(
+        self, text: str, splits: List[int], original_chunk: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """Split text at given positions, creating sub-chunks up to max size."""
+        # Build paragraph segments
+        points = sorted(set(splits + [len(text)]))
+        paragraphs = []
+        prev = 0
+        for pos in points:
+            seg = text[prev:pos]
+            if seg.strip():
+                paragraphs.append(seg)
+            prev = pos
+
+        # Greedily combine paragraphs until adding the next would exceed max_chunk_size
+        result = []
+        current = ""
+        for seg in paragraphs:
+            if not current:
+                current = seg
+                continue
+
+            if len(current) + len(seg) <= self.max_chunk_size:
+                current += seg
+            else:
+                result.append(self._make_sub_chunk(current, original_chunk))
+                current = seg
+
+        if current:
+            result.append(self._make_sub_chunk(current, original_chunk))
+
+        return result
+
+    def _make_sub_chunk(
+        self, raw: str, original_chunk: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Create a sub-chunk with proper metadata."""
+        return {
+            "raw_chunk": raw,
+            "enhanced_chunk": self._make_enhanced_chunk(raw, original_chunk),
+            "header_path": original_chunk.get("header_path", []),
+            "level": original_chunk.get("level", 0),
+            "title": original_chunk.get("title", ""),
+            "start": original_chunk.get("start", 0),
+            "end": original_chunk.get("end", 0),
+        }
+
+    def _make_enhanced_chunk(
+        self, raw_chunk: str, original_chunk: Dict[str, Any]
+    ) -> str:
+        """Create enhanced chunk by adding ancestor headers to raw chunk."""
+        header_path = original_chunk.get("header_path", [])
+
+        # If there are ancestors (more than just this chunk's title), add them
+        if len(header_path) > 1:
+            ancestor_titles = header_path[:-1]
+            ancestor_lines = [f"## {title}" for title in ancestor_titles]
+            prefix = "\n".join(ancestor_lines) + "\n\n"
+            return prefix + raw_chunk
+
+        return raw_chunk
 
 
 class ChonkieChunkerProvider(ChunkerProvider):

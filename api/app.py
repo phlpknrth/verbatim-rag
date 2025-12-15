@@ -50,6 +50,9 @@ logger = logging.getLogger(__name__)
 class QueryRequestModel(BaseModel):
     question: str
     template_id: Optional[str] = None
+    k: Optional[int] = None
+    hybrid_weights: Optional[dict[str, float]] = None
+    rrf_k: int = 60
 
 
 class StreamQueryRequestModel(BaseModel):
@@ -205,7 +208,12 @@ async def query_endpoint(
         api_service.validate_query_request(request.question)
 
         # Execute query using the RAG package directly
-        response = api_service.rag.query(request.question)
+        response = api_service.rag.query(
+            request.question,
+            k=request.k,
+            hybrid_weights=request.hybrid_weights,
+            rrf_k=request.rrf_k,
+        )
 
         return response
     except ValueError as e:
@@ -224,7 +232,13 @@ async def query_async_endpoint(
     """Async query endpoint using async RAG pipeline."""
     try:
         api_service.validate_query_request(request.question)
-        response = await api_service.query_async(request.question, request.template_id)
+        response = await api_service.query_async(
+            request.question,
+            request.template_id,
+            k=request.k,
+            hybrid_weights=request.hybrid_weights,
+            rrf_k=request.rrf_k,
+        )
         return response
     except Exception as e:
         logger.error(f"Async query failed: {e}")
@@ -274,7 +288,12 @@ async def query_async_endpoint(
         api_service.validate_query_request(request.question)
 
         # Execute async query using the RAG package directly
-        response = await api_service.rag.query_async(request.question)
+        response = await api_service.rag.query_async(
+            request.question,
+            k=request.k,
+            hybrid_weights=request.hybrid_weights,
+            rrf_k=request.rrf_k,
+        )
 
         return response
 

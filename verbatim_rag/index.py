@@ -2,6 +2,8 @@
 Unified index class for the Verbatim RAG system.
 """
 
+import logging
+
 from typing import List, Optional, Dict, Any, Union, Tuple
 from tqdm import tqdm
 from verbatim_rag.document import Document
@@ -54,9 +56,12 @@ class VerbatimIndex:
             ValueError: If both embedding providers are None
         """
         if dense_provider is None and sparse_provider is None:
-            raise ValueError(
-                "At least one embedding provider (dense or sparse) must be provided"
-            )
+            # Allow provider-less setup only if the vector store supports full text search
+            has_full_text = bool(getattr(vector_store, "enable_full_text", False))
+            if not has_full_text:
+                raise ValueError(
+                    "At least one embedding provider (dense or sparse) must be provided"
+                )
 
         self.vector_store = vector_store
         self.dense_provider = dense_provider
@@ -175,9 +180,14 @@ class VerbatimIndex:
         Returns:
             Text with document metadata appended
         """
-        parts = [text, "", "---"]
+        parts = []
+        if doc.title:
+            parts.append(f"# {doc.title}\n\n")
+
+        parts += [text, "", "---"]
         parts.append(f"Document: {doc.title or 'Unknown'}")
-        parts.append(f"Source: {doc.source or 'Unknown'}")
+        if doc.source:
+            parts.append(f"Source: {doc.source or 'Unknown'}")
 
         # Add custom metadata (skip sensitive fields)
         if doc.metadata:
@@ -389,7 +399,9 @@ class VerbatimIndex:
             chunks_list.append(chunk)
 
         # Step 3: Generate embeddings for all enhanced texts
+        logging.debug("generating embeddings...")
         dense_embeddings, sparse_embeddings = self._generate_embeddings(enhanced_texts)
+        logging.debug("DONE generating embeddings.")
 
         # Step 4: Prepare metadata for each chunk
         metadatas = [self._prepare_chunk_metadata(doc, chunk) for chunk in chunks_list]
@@ -475,16 +487,20 @@ class VerbatimIndex:
         search_type: str = "auto",
         filter: Optional[str] = None,
         search_params: Optional[Dict[str, Any]] = None,
+        hybrid_weights: Optional[Dict[str, float]] = None,
+        rrf_k: int = 60,
     ) -> List[SearchResult]:
         """
-        Query for documents using vector search or filtering.
+        Query for documents using vector search, full text search, or filtering.
 
         Args:
-            text: Optional text query for vector search
+            text: Optional text query for vector search or full text search
             k: Number of documents to retrieve
-            search_type: Type of search ("dense", "sparse", "hybrid", "auto")
+            search_type: Type of search ("dense", "sparse", "hybrid", "full_text", "auto")
             filter: Optional Milvus filter expression for metadata filtering
             search_params: Optional dict of search parameters (e.g., {"nprobe": 128} for IVF indexes)
+            hybrid_weights: Optional dict mapping method names to weights (e.g., {"dense": 0.5, "sparse": 0.3, "full_text": 0.2})
+            rrf_k: RRF constant for hybrid search (default: 60)
 
         Returns:
             List of SearchResult objects
@@ -498,28 +514,74 @@ class VerbatimIndex:
                 top_k=k,
                 filter=filter,
                 search_params=search_params,
+                hybrid_weights=hybrid_weights,
+                rrf_k=rrf_k,
+            )
+
+        # Full text search - no embeddings needed
+        if search_type == "full_text":
+            return self.vector_store.query(
+                dense_query=None,
+                sparse_query=None,
+                text_query=text,
+                top_k=k,
+                search_type="full_text",
+                filter=filter,
+                search_params=search_params,
+                hybrid_weights=hybrid_weights,
+                rrf_k=rrf_k,
             )
 
         # Auto-detect search type based on available providers
         if search_type == "auto":
-            if self.dense_provider and self.sparse_provider:
+            dense_available = bool(self.dense_provider)
+            sparse_available = bool(self.sparse_provider)
+            full_text_available = bool(
+                getattr(self.vector_store, "enable_full_text", False)
+            )
+
+            if dense_available and sparse_available:
                 search_type = "hybrid"
-            elif self.sparse_provider:
-                search_type = "sparse"
-            elif self.dense_provider:
+            elif dense_available:
                 search_type = "dense"
+            elif sparse_available:
+                search_type = "sparse"
+            elif full_text_available:
+                search_type = "full_text"
             else:
                 raise ValueError("No embedding providers available")
 
-        # Generate query embeddings
+        # If auto-detected full text search, use it
+        if search_type == "full_text":
+            return self.vector_store.query(
+                dense_query=None,
+                sparse_query=None,
+                text_query=text,
+                top_k=k,
+                search_type="full_text",
+                filter=filter,
+                search_params=search_params,
+                hybrid_weights=hybrid_weights,
+                rrf_k=rrf_k,
+            )
+
+        # Generate query embeddings for vector search
         query_dense = None
         query_sparse = None
 
-        if search_type in ["dense", "hybrid"] and self.dense_provider:
-            query_dense = self.dense_provider.embed_text(text)
+        # NEW: If hybrid_weights provided, generate embeddings based on what's requested
+        if hybrid_weights is not None:
+            if "dense" in hybrid_weights and self.dense_provider:
+                query_dense = self.dense_provider.embed_text(text)
+            if "sparse" in hybrid_weights and self.sparse_provider:
+                query_sparse = self.sparse_provider.embed_text(text)
+        else:
+            # LEGACY: Generate embeddings based on search_type
+            if search_type in ["dense", "hybrid"] and self.dense_provider:
+                query_dense = self.dense_provider.embed_text(text)
 
-        if search_type in ["sparse", "hybrid"] and self.sparse_provider:
-            query_sparse = self.sparse_provider.embed_text(text)
+            if search_type in ["sparse", "hybrid"] and self.sparse_provider:
+                query_sparse = self.sparse_provider.embed_text(text)
 
         # Search using vector store
         return self.vector_store.query(
@@ -530,6 +592,8 @@ class VerbatimIndex:
             search_type=search_type,
             filter=filter,
             search_params=search_params,
+            hybrid_weights=hybrid_weights,
+            rrf_k=rrf_k,
         )
 
     def get_document(self, document_id: str) -> Optional[Dict[str, Any]]:
@@ -652,9 +716,11 @@ class VerbatimIndex:
             "sample_chunks": [
                 {
                     "id": chunk.id,
-                    "text_preview": chunk.text[:100] + "..."
-                    if len(chunk.text) > 100
-                    else chunk.text,
+                    "text_preview": (
+                        chunk.text[:100] + "..."
+                        if len(chunk.text) > 100
+                        else chunk.text
+                    ),
                     "document_id": chunk.metadata.get("document_id"),
                     "chunk_number": chunk.metadata.get("chunk_number"),
                 }
