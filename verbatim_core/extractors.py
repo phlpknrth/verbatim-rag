@@ -625,6 +625,93 @@ class RuleChefSpanExtractor(SpanExtractor):
             print("Warning: No examples provided. Learning rules without examples.")
         self.chef.learn_rules()
 
+    def save_examples(self, file_path: str) -> None:
+        """
+        Save training examples to a JSON file.
+
+        :param file_path: Path where to save the examples
+        """
+        os.makedirs(os.path.dirname(file_path) if os.path.dirname(file_path) else ".", exist_ok=True)
+        
+        # Convert to serializable format
+        serializable_examples = [
+            {
+                "input": example[0],
+                "output": example[1]
+            }
+            for example in self.examples
+        ]
+        
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(serializable_examples, f, indent=2, ensure_ascii=False)
+        
+        print(f"✅ {len(self.examples)} training examples saved to {file_path}")
+
+    @staticmethod
+    def load_examples(file_path: str) -> List[tuple[Dict[str, Any], Dict[str, Any]]]:
+        """
+        Load training examples from a JSON file.
+
+        :param file_path: Path to the JSON file with examples
+        :return: List of (input, output) tuples
+        """
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        examples = [
+            (ex["input"], ex["output"])
+            for ex in data
+        ]
+        
+        print(f"✅ {len(examples)} training examples loaded from {file_path}")
+        return examples
+
+    @classmethod
+    def from_saved_examples(
+        cls,
+        examples_path: str,
+        model_name: str = "gpt-4o-mini",
+        task_name: str = "Span Extraction",
+        task_description: str = "Extract relevant answer spans from documents",
+        auto_learn: bool = True,
+        llm_client: LLMClient | None = None,
+    ) -> "RuleChefSpanExtractor":
+        """
+        Create a RuleChefSpanExtractor from saved training examples (factory method).
+
+        This is a convenience method to load examples from a JSON file and create
+        an extractor instance. The examples should be in the format:
+        [{"input": {"question": "...", "context": "..."}, "output": {"spans": [...]}}, ...]
+
+        :param examples_path: Path to JSON file with saved examples
+        :param model_name: Name of the LLM model to use (if creating new client)
+        :param task_name: Name for the RuleChef task
+        :param task_description: Description for the RuleChef task
+        :param auto_learn: Whether to automatically learn rules from examples on init
+        :param llm_client: Optional LLM client (creates one if None)
+        :return: RuleChefSpanExtractor instance
+        """
+        examples = cls.load_examples(examples_path)
+        
+        if auto_learn:
+            print(f"\n📚 Creating RuleChef Extractor and learning rules...")
+            print(f"   ⚠️  This may take several minutes with many examples ({len(examples)})...")
+        else:
+            print(f"\n📚 Creating RuleChef Extractor (without learning rules now)...")
+            print(f"   💡 For better results, set auto_learn=True (takes longer)")
+        
+        extractor = cls(
+            llm_client=llm_client,
+            model=model_name,
+            examples=examples,
+            task_name=task_name,
+            task_description=task_description,
+            auto_learn=auto_learn,
+        )
+        
+        print("✅ RuleChef Extractor loaded!")
+        return extractor
+
     def extract_spans(
         self, question: str, search_results: List[Any]
     ) -> Dict[str, List[str]]:
