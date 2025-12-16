@@ -61,7 +61,11 @@ class SentenceTransformersProvider(DenseEmbeddingProvider):
         try:
             from sentence_transformers import SentenceTransformer
 
-            self.model = SentenceTransformer(self.model_name, device=self.device)
+            self.model = SentenceTransformer(
+                self.model_name,
+                device=self.device,
+                model_kwargs={"low_cpu_mem_usage": True, "device_map": None},
+            )
             logger.info(f"Loaded SentenceTransformers model: {self.model_name}")
         except ImportError:
             raise ImportError("pip install sentence-transformers")
@@ -121,7 +125,11 @@ class SpladeProvider(SparseEmbeddingProvider):
         try:
             from sentence_transformers import SparseEncoder
 
-            self.model = SparseEncoder(self.model_name, device=self.device)
+            self.model = SparseEncoder(
+                self.model_name,
+                device=self.device,
+                model_kwargs={"low_cpu_mem_usage": True, "device_map": None},
+            )
             logger.info(f"Loaded SPLADE model: {self.model_name}")
         except ImportError:
             raise ImportError("pip install sentence-transformers")
