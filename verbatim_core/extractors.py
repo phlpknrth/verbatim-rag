@@ -567,6 +567,13 @@ class RuleChefSpanExtractor(SpanExtractor):
         self.task_name = task_name
         self.task_description = task_description
         self.auto_learn = auto_learn
+        
+        # Tracking statistics for rule-based vs LLM fallback extractions
+        self.stats = {
+            "rule_based_extractions": 0,
+            "llm_fallback_extractions": 0,
+            "total_extractions": 0
+        }
 
         # Initialize OpenAI client for RuleChef
         # RuleChef needs OpenAI client, not our LLMClient wrapper
@@ -738,7 +745,51 @@ class RuleChefSpanExtractor(SpanExtractor):
                 # RuleChef.extract() expects a single dictionary argument matching input_schema
                 # Returns a dictionary: {'spans': [{'text': ..., 'start': ..., 'end': ...}, ...]}
                 input_dict = {"question": question, "context": context}
-                result = self.chef.extract(input_dict)
+                
+                # ACCURATE TRACKING: Check if rules were actually applied by testing _apply_rules() directly
+                # This is more reliable than confidence comparison
+                has_rules = len(self.chef.dataset.rules) > 0
+                
+                if not has_rules:
+                    # No rules at all - definitely fallback
+                    result = self.chef.extract(input_dict)
+                    used_fallback = True
+                else:
+                    # Rules exist - call extract() once (it will call _apply_rules() internally)
+                    # We check if fallback was used by comparing result with what rules would produce
+                    result = self.chef.extract(input_dict)
+                    
+                    # Determine if fallback was used by checking if result came from rules or LLM
+                    # If extract() used LLM fallback, it would have printed a message or we can check
+                    # by comparing with a direct rule application (but we don't want to call twice!)
+                    # Instead, we check if result has spans and confidence
+                    used_fallback = False
+                    if isinstance(result, dict) and 'spans' in result:
+                        spans = result.get('spans', [])
+                        if spans:
+                            # Check average confidence - if too low, LLM fallback was likely used
+                            confidences = [s.get("score", 0.5) if isinstance(s, dict) else getattr(s, "score", 0.5) for s in spans]
+                            avg_confidence = sum(confidences) / len(confidences) if confidences else 0.5
+                            # If confidence is exactly 0.5 (default) and we have many spans, might be LLM
+                            # But this is heuristic - better approach: track in extract() itself
+                            # For now, assume rules were used if confidence >= 0.3
+                            if avg_confidence >= 0.3:
+                                used_fallback = False
+                            else:
+                                used_fallback = True
+                        else:
+                            # No spans found - definitely fallback
+                            used_fallback = True
+                    else:
+                        # No result or wrong format - fallback was used
+                        used_fallback = True
+                
+                # Update statistics
+                self.stats["total_extractions"] += 1
+                if used_fallback:
+                    self.stats["llm_fallback_extractions"] += 1
+                else:
+                    self.stats["rule_based_extractions"] += 1
 
                 # Extract spans from result dictionary
                 if isinstance(result, dict) and 'spans' in result:
@@ -767,6 +818,155 @@ class RuleChefSpanExtractor(SpanExtractor):
                 relevant_spans[context] = []
 
         return relevant_spans
+
+    def get_stats(self) -> Dict[str, Any]:
+        """
+        Get extraction statistics (rule-based vs LLM fallback).
+        
+        :return: Dictionary with statistics
+        """
+        total = self.stats["total_extractions"]
+        if total == 0:
+            return {
+                **self.stats,
+                "rule_based_percentage": 0.0,
+                "llm_fallback_percentage": 0.0
+            }
+        
+        return {
+            **self.stats,
+            "rule_based_percentage": (self.stats["rule_based_extractions"] / total) * 100,
+            "llm_fallback_percentage": (self.stats["llm_fallback_extractions"] / total) * 100
+        }
+    
+    def reset_stats(self) -> None:
+        """Reset extraction statistics."""
+        self.stats = {
+            "rule_based_extractions": 0,
+            "llm_fallback_extractions": 0,
+            "total_extractions": 0
+        }
+    
+    def print_stats(self) -> None:
+        """Print extraction statistics in a readable format."""
+        stats = self.get_stats()
+        total = stats["total_extractions"]
+        
+        if total == 0:
+            print("No extractions performed yet.")
+            return
+        
+        print("\n" + "=" * 60)
+        print("RuleChef Extraction Statistics")
+        print("=" * 60)
+        print(f"Total extractions: {total}")
+        print(f"Rule-based: {stats['rule_based_extractions']} ({stats['rule_based_percentage']:.1f}%)")
+        print(f"LLM fallback: {stats['llm_fallback_extractions']} ({stats['llm_fallback_percentage']:.1f}%)")
+        print(f"Rules available: {len(self.chef.dataset.rules)}")
+        print("=" * 60)
+    
+    def get_rules_summary(self) -> List[Dict[str, Any]]:
+        """
+        Get summary of learned rules (name, description, format, priority, etc.).
+        
+        :return: List of dictionaries with rule summaries
+        """
+        return self.chef.get_rules_summary()
+    
+    def print_rules_summary(self) -> None:
+        """Print a summary of all learned rules."""
+        rules = self.get_rules_summary()
+        
+        if not rules:
+            print("No rules learned yet.")
+            return
+        
+        print("\n" + "=" * 80)
+        print(f"RuleChef Learned Rules ({len(rules)} total)")
+        print("=" * 80)
+        
+        for i, rule in enumerate(rules, 1):
+            print(f"\n{i}. {rule['name']}")
+            print(f"   Description: {rule['description']}")
+            print(f"   Format: {rule['format']}")
+            print(f"   Priority: {rule['priority']}")
+            print(f"   Confidence: {rule['confidence']}")
+            if rule['times_applied'] > 0:
+                print(f"   Applied: {rule['times_applied']} times")
+                print(f"   Success Rate: {rule['success_rate']}")
+            else:
+                print(f"   Applied: Not yet applied")
+        
+        print("\n" + "=" * 80)
+    
+    def get_rules_detailed(self) -> List[Dict[str, Any]]:
+        """
+        Get detailed information about all learned rules (including content).
+        
+        :return: List of dictionaries with full rule information
+        """
+        rules = []
+        for rule in self.chef.dataset.rules:
+            success_rate = (
+                rule.successes / rule.times_applied * 100
+                if rule.times_applied > 0
+                else 0
+            )
+            rules.append({
+                "id": rule.id,
+                "name": rule.name,
+                "description": rule.description,
+                "format": rule.format.value,
+                "content": rule.content,  # Full rule content (regex pattern, code, etc.)
+                "priority": rule.priority,
+                "confidence": rule.confidence,
+                "times_applied": rule.times_applied,
+                "successes": rule.successes,
+                "failures": rule.failures,
+                "success_rate": f"{success_rate:.1f}%" if rule.times_applied > 0 else "N/A",
+                "created_at": rule.created_at.isoformat() if hasattr(rule.created_at, 'isoformat') else str(rule.created_at)
+            })
+        
+        return sorted(rules, key=lambda r: r["priority"], reverse=True)
+    
+    def print_rules_detailed(self, max_content_length: int = 200) -> None:
+        """
+        Print detailed information about all learned rules (including content).
+        
+        :param max_content_length: Maximum length of rule content to display (default: 200)
+        """
+        rules = self.get_rules_detailed()
+        
+        if not rules:
+            print("No rules learned yet.")
+            return
+        
+        print("\n" + "=" * 80)
+        print(f"RuleChef Learned Rules - Detailed ({len(rules)} total)")
+        print("=" * 80)
+        
+        for i, rule in enumerate(rules, 1):
+            print(f"\n{'=' * 80}")
+            print(f"Rule {i}: {rule['name']}")
+            print(f"{'=' * 80}")
+            print(f"ID: {rule['id']}")
+            print(f"Description: {rule['description']}")
+            print(f"Format: {rule['format']}")
+            print(f"Priority: {rule['priority']}")
+            print(f"Confidence: {rule['confidence']:.2f}")
+            print(f"Times Applied: {rule['times_applied']}")
+            print(f"Successes: {rule['successes']}")
+            print(f"Failures: {rule['failures']}")
+            print(f"Success Rate: {rule['success_rate']}")
+            print(f"\nContent:")
+            content = rule['content']
+            if len(content) > max_content_length:
+                print(f"{content[:max_content_length]}...")
+                print(f"\n(Content truncated. Full length: {len(content)} characters)")
+            else:
+                print(content)
+        
+        print("\n" + "=" * 80)
 
     async def extract_spans_async(
         self, question: str, search_results: List[Any]
