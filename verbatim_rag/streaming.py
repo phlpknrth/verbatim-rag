@@ -43,8 +43,20 @@ class StreamingRAG:
                 original_k = self.rag.k
                 self.rag.k = num_docs
 
+            # Optional intent detection short-circuit
+            decision = await self.rag._detect_intent_async(question)
+            route = self.rag._decision_field(decision, "route")
+            if decision and route and route != "continue":
+                answer = self.rag._decision_field(decision, "answer", "") or ""
+                result = self.rag._build_short_circuit_response(question, answer)
+                yield {"type": "answer", "data": result.model_dump(), "done": True}
+                if num_docs is not None:
+                    self.rag.k = original_k
+                return
+
             # Step 1: Retrieve documents and send them without highlights
             docs = self.rag.index.query(text=question, k=self.rag.k, filter=filter)
+            docs = await self.rag._apply_reranker_async(question, docs)
 
             documents_without_highlights = [
                 DocumentWithHighlights(

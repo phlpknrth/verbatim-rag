@@ -7,6 +7,8 @@ limit) expand to a numbered reference token (e.g. "[6]") without verbatim text.
 """
 
 from typing import Optional
+import asyncio
+import logging
 from verbatim_rag.extractors import LLMSpanExtractor, SpanExtractor
 from verbatim_rag.index import VerbatimIndex
 from verbatim_rag.models import QueryResponse
@@ -60,6 +62,8 @@ class VerbatimRAG:
         template_mode: str = "contextual",  # "static", "contextual", "random"
         extraction_mode: str = "auto",  # "batch", "individual", "auto"
         llm_client: LLMClient = None,
+        intent_detector=None,
+        reranker=None,
     ):
         """
         Initialize the Verbatim RAG system with clean architecture.
@@ -77,6 +81,8 @@ class VerbatimRAG:
         self.index = index
         self.k = k
         self.max_display_spans = max_display_spans
+        self.intent_detector = intent_detector
+        self.reranker = reranker
 
         # Centralized LLM client
         self.llm_client = llm_client or LLMClient(model)
@@ -96,6 +102,59 @@ class VerbatimRAG:
         self.template_manager.set_rag_system(self)
 
         self.response_builder = ResponseBuilder()
+
+    def _build_short_circuit_response(
+        self, question: str, answer: str
+    ) -> QueryResponse:
+        cleaned = self.response_builder.clean_answer(answer or "")
+        return self.response_builder.build_response(
+            question=question,
+            answer=cleaned,
+            search_results=[],
+            relevant_spans={},
+            display_span_count=0,
+        )
+
+    def _decision_field(self, decision, field: str, default=None):
+        if isinstance(decision, dict):
+            return decision.get(field, default)
+        return getattr(decision, field, default)
+
+    def _apply_reranker(self, question: str, results: list):
+        if not self.reranker:
+            return results
+        try:
+            return self.reranker.rerank(question, results)
+        except Exception as exc:
+            logging.warning(f"Reranker failed, using original order: {exc}")
+            return results
+
+    async def _apply_reranker_async(self, question: str, results: list):
+        if not self.reranker:
+            return results
+        try:
+            if hasattr(self.reranker, "rerank_async"):
+                return await self.reranker.rerank_async(question, results)
+            return await asyncio.to_thread(self.reranker.rerank, question, results)
+        except Exception as exc:
+            logging.warning(f"Async reranker failed, using original order: {exc}")
+            return results
+
+    def _detect_intent(self, question: str):
+        if not self.intent_detector:
+            return None
+        if hasattr(self.intent_detector, "detect"):
+            return self.intent_detector.detect(question)
+        return None
+
+    async def _detect_intent_async(self, question: str):
+        if not self.intent_detector:
+            return None
+        if hasattr(self.intent_detector, "detect_async"):
+            return await self.intent_detector.detect_async(question)
+        if hasattr(self.intent_detector, "detect"):
+            return await asyncio.to_thread(self.intent_detector.detect, question)
+        return None
 
     def _generate_template(
         self, question: str, display_spans: list[str] = None, citation_count: int = 0
@@ -168,6 +227,13 @@ class VerbatimRAG:
         :param rrf_k: RRF constant for hybrid search (default: 60)
         :return: A QueryResponse object containing the structured response
         """
+        # Step 0: Optional intent detection
+        decision = self._detect_intent(question)
+        route = self._decision_field(decision, "route")
+        if decision and route and route != "continue":
+            answer = self._decision_field(decision, "answer", "") or ""
+            return self._build_short_circuit_response(question, answer)
+
         # Step 1: Retrieve documents
         k = k or self.k
         search_results = self.index.query(
@@ -177,6 +243,7 @@ class VerbatimRAG:
             hybrid_weights=hybrid_weights,
             rrf_k=rrf_k,
         )
+        search_results = self._apply_reranker(question, search_results)
 
         # Step 2: Check mode and extract accordingly
         if self.template_manager.current_mode == "structured":
@@ -257,6 +324,13 @@ class VerbatimRAG:
         :param rrf_k: RRF constant for hybrid search (default: 60)
         :return: A QueryResponse object containing the structured response
         """
+        # Step 0: Optional intent detection
+        decision = await self._detect_intent_async(question)
+        route = self._decision_field(decision, "route")
+        if decision and route and route != "continue":
+            answer = self._decision_field(decision, "answer", "") or ""
+            return self._build_short_circuit_response(question, answer)
+
         # Step 1: Retrieve documents
         k = k or self.k
         search_results = self.index.query(
@@ -266,6 +340,7 @@ class VerbatimRAG:
             hybrid_weights=hybrid_weights,
             rrf_k=rrf_k,
         )
+        search_results = await self._apply_reranker_async(question, search_results)
 
         # Step 2: Check mode and extract accordingly
         if self.template_manager.current_mode == "structured":

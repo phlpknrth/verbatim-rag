@@ -17,6 +17,27 @@ class SearchResult:
     text: str  # Original clean text for display
     enhanced_text: str = ""  # Enhanced text used for vectorization
 
+    def __repr__(self) -> str:
+        return f"SearchResult(id={self.id}, score={self.score}, metadata={self.metadata}, text={self.text}, enhanced_text={self.enhanced_text})"
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+    def __format__(self, format_spec: str) -> str:
+        return self.__repr__()
+
+    def __gt__(self, other: "SearchResult") -> bool:
+        return self.score > other.score
+
+    def __lt__(self, other: "SearchResult") -> bool:
+        return self.score < other.score
+
+    def __eq__(self, other: "SearchResult") -> bool:
+        return self.score == other.score
+
+    def __hash__(self) -> int:
+        return hash((self.id, self.score, self.metadata, self.text, self.enhanced_text))
+
 
 class VectorStore(ABC):
     """Base vector store interface."""

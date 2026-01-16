@@ -27,6 +27,15 @@ from verbatim_rag.transform import VerbatimTransform
 from verbatim_rag.transform import verbatim_query, verbatim_query_async
 from verbatim_rag.providers import RAGProvider, IndexProvider, VerbatimRAGProvider
 from verbatim_rag.universal_document import UniversalDocument
+from verbatim_rag.intent import IntentDecision, IntentDetector, LLMIntentDetector
+from verbatim_rag.rerankers import (
+    Reranker,
+    BaseReranker,
+    CohereReranker,
+    JinaReranker,
+    SentenceTransformersReranker,
+    JinaV3Reranker,
+)
 
 # Optional ingestion module (requires docling + chonkie)
 try:
